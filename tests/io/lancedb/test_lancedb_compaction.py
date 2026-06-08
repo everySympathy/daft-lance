@@ -6,8 +6,10 @@ import lance
 import pandas as pd
 import pyarrow as pa
 import pytest
+from lance import Blob
 
 from daft_lance import compact_files
+from daft_lance.lance_compaction import compact_files_internal
 
 
 def create_dataset_with_fragments(path: Path, fragment_data: list[pd.DataFrame]):
@@ -114,6 +116,250 @@ def test_invalid_compaction_options_key(tmp_path: Path):
 
     with pytest.raises(ValueError):
         compact_files(uri=str(dataset_path), compaction_options={"nonexistent_option": True})
+
+
+def _blob_v2_table(
+    ids: list[int],
+    labels: list[str],
+    blobs: list[object],
+    *,
+    schema_metadata: dict[bytes, bytes] | None = None,
+    label_metadata: dict[bytes, bytes] | None = None,
+) -> pa.Table:
+    arrays = [
+        pa.array(ids, type=pa.int64()),
+        pa.array(labels, type=pa.string()),
+        lance.blob_array(blobs),
+    ]
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False),
+            pa.field("label", pa.string(), nullable=False, metadata=label_metadata),
+            pa.field("blob", arrays[2].type, nullable=False),
+        ],
+        metadata=schema_metadata,
+    )
+    return pa.Table.from_arrays(arrays, schema=schema)
+
+
+def _read_blob_bytes_by_id(uri: str) -> dict[int, tuple[str, bytes]]:
+    ds = lance.dataset(uri)
+    rows = ds.to_table(columns=["id", "label"], with_row_id=True).to_pylist()
+    row_ids = [row["_rowid"] for row in rows]
+    blobs = ds.take_blobs("blob", row_ids)
+    out: dict[int, tuple[str, bytes]] = {}
+    for row, blob in zip(rows, blobs, strict=True):
+        with blob as f:
+            out[row["id"]] = (row["label"], f.read())
+    return out
+
+
+def test_blob_v2_compaction_preserves_blob_bytes(tmp_path: Path):
+    """Blob V2 compaction rewrites visible rows while preserving blob bytes."""
+    dataset_path = tmp_path / "test_blob_v2_compaction"
+    external_path = tmp_path / "external.bin"
+    external_path.write_bytes(b"external-" * 1024)
+    external_uri = f"file://{external_path}"
+
+    expected = {
+        1: ("inline", b"tiny-inline"),
+        2: ("packed", b"x" * 100_000),
+        3: ("dedicated", b"y" * 5_000_000),
+        4: ("external", external_path.read_bytes()),
+        5: ("external-slice", external_path.read_bytes()[128:512]),
+    }
+    lance.write_dataset(
+        _blob_v2_table(
+            [1, 2],
+            ["inline", "packed"],
+            [expected[1][1], expected[2][1]],
+        ),
+        dataset_path,
+        data_storage_version="2.2",
+        max_rows_per_file=2,
+        allow_external_blob_outside_bases=True,
+    )
+    lance.write_dataset(
+        _blob_v2_table(
+            [3, 4, 5],
+            ["dedicated", "external", "external-slice"],
+            [
+                expected[3][1],
+                external_uri,
+                Blob.from_uri(external_uri, position=128, size=384),
+            ],
+        ),
+        dataset_path,
+        mode="append",
+        data_storage_version="2.2",
+        max_rows_per_file=3,
+        allow_external_blob_outside_bases=True,
+    )
+
+    ds = lance.dataset(str(dataset_path))
+    assert len(ds.get_fragments()) == 2
+    assert _read_blob_bytes_by_id(str(dataset_path)) == expected
+
+    metrics = compact_files(
+        uri=str(dataset_path),
+        compaction_options={
+            "target_rows_per_fragment": 100,
+            "num_threads": 1,
+        },
+    )
+
+    assert metrics is not None
+    assert getattr(metrics, "fragments_removed", None) == 2
+    assert getattr(metrics, "fragments_added", None) == 1
+    assert getattr(metrics, "files_removed", None) == 2
+    assert getattr(metrics, "files_added", None) == 1
+    ds = lance.dataset(str(dataset_path))
+    assert len(ds.get_fragments()) == 1
+    external_path.unlink()
+    assert _read_blob_bytes_by_id(str(dataset_path)) == expected
+
+
+def test_blob_v2_compaction_materializes_single_fragment_deletions(tmp_path: Path):
+    """Blob V2 fallback should materialize deletions even when fragment count is already one."""
+    dataset_path = tmp_path / "test_blob_v2_single_fragment_deletion"
+    lance.write_dataset(
+        _blob_v2_table([1, 2, 3], ["one", "two", "three"], [b"1", b"2", b"3"]),
+        dataset_path,
+        data_storage_version="2.2",
+        max_rows_per_file=10,
+    )
+    ds = lance.dataset(str(dataset_path))
+    ds.delete("id = 2")
+    ds = lance.dataset(str(dataset_path))
+    assert len(ds.get_fragments()) == 1
+    assert ds.get_fragments()[0].num_deletions == 1
+    assert _read_blob_bytes_by_id(str(dataset_path)) == {1: ("one", b"1"), 3: ("three", b"3")}
+
+    metrics = compact_files(
+        uri=str(dataset_path),
+        compaction_options={
+            "materialize_deletions": True,
+            "target_rows_per_fragment": 100,
+            "num_threads": 1,
+        },
+    )
+
+    assert metrics is not None
+    ds = lance.dataset(str(dataset_path))
+    assert len(ds.get_fragments()) == 1
+    assert ds.get_fragments()[0].num_deletions == 0
+    assert _read_blob_bytes_by_id(str(dataset_path)) == {1: ("one", b"1"), 3: ("three", b"3")}
+
+
+def test_blob_v2_compaction_rejects_stale_versions(tmp_path: Path):
+    """Fallback overwrite must not compact a non-latest snapshot into latest."""
+    dataset_path = tmp_path / "test_blob_v2_stale_version_compaction"
+    ds = lance.write_dataset(
+        _blob_v2_table([1], ["one"], [b"1"]),
+        dataset_path,
+        data_storage_version="2.2",
+        max_rows_per_file=1,
+    )
+    stale_version = ds.version
+    lance.write_dataset(
+        _blob_v2_table([2], ["two"], [b"2"]),
+        dataset_path,
+        mode="append",
+        data_storage_version="2.2",
+        max_rows_per_file=1,
+    )
+
+    with pytest.raises(ValueError, match="latest dataset version"):
+        compact_files(
+            uri=str(dataset_path), version=stale_version, compaction_options={"target_rows_per_fragment": 100}
+        )
+
+    assert _read_blob_bytes_by_id(str(dataset_path)) == {1: ("one", b"1"), 2: ("two", b"2")}
+
+
+def test_blob_v2_compaction_validates_options(tmp_path: Path):
+    """Unknown compaction options should be rejected on the Blob V2 path too."""
+    dataset_path = tmp_path / "test_blob_v2_invalid_options"
+    lance.write_dataset(
+        _blob_v2_table([1], ["one"], [b"1"]),
+        dataset_path,
+        data_storage_version="2.2",
+        max_rows_per_file=1,
+    )
+    lance.write_dataset(
+        _blob_v2_table([2], ["two"], [b"2"]),
+        dataset_path,
+        mode="append",
+        data_storage_version="2.2",
+        max_rows_per_file=1,
+    )
+
+    with pytest.raises(ValueError, match="Invalid compaction options"):
+        compact_files(uri=str(dataset_path), compaction_options={"nonexistent_option": True})
+
+
+def test_blob_v2_compaction_preserves_schema_metadata(tmp_path: Path):
+    """Fallback should keep non-blob field metadata and nullability while rebuilding the table."""
+    dataset_path = tmp_path / "test_blob_v2_schema_metadata"
+    lance.write_dataset(
+        _blob_v2_table(
+            [1],
+            ["one"],
+            [b"1"],
+            schema_metadata={b"schema-key": b"schema-value"},
+            label_metadata={b"field-key": b"field-value"},
+        ),
+        dataset_path,
+        data_storage_version="2.2",
+        max_rows_per_file=1,
+    )
+    lance.write_dataset(
+        _blob_v2_table(
+            [2],
+            ["two"],
+            [b"2"],
+            schema_metadata={b"schema-key": b"schema-value"},
+            label_metadata={b"field-key": b"field-value"},
+        ),
+        dataset_path,
+        mode="append",
+        data_storage_version="2.2",
+        max_rows_per_file=1,
+    )
+
+    before_schema = lance.dataset(str(dataset_path)).schema
+    compact_files(uri=str(dataset_path), compaction_options={"target_rows_per_fragment": 100})
+    after_schema = lance.dataset(str(dataset_path)).schema
+
+    assert after_schema == before_schema
+    assert after_schema.metadata == {b"schema-key": b"schema-value"}
+    assert after_schema.field("label").metadata == {b"field-key": b"field-value"}
+    assert after_schema.field("label").nullable is False
+
+
+def test_non_blob_compaction_still_reaches_planning(monkeypatch):
+    """The Blob V2 fallback should not intercept ordinary Lance datasets."""
+
+    class FakeDataset:
+        schema = pa.schema([("id", pa.int64())])
+
+    class EmptyPlan:
+        tasks = []
+
+        def num_tasks(self):
+            return 0
+
+    planned = False
+
+    def plan(*args, **kwargs):
+        nonlocal planned
+        planned = True
+        return EmptyPlan()
+
+    monkeypatch.setattr("daft_lance.lance_compaction.Compaction.plan", plan)
+
+    assert compact_files_internal(FakeDataset()) is None  # type: ignore[arg-type]
+    assert planned is True
 
 
 def test_compaction_with_partition_num(tmp_path: Path):
