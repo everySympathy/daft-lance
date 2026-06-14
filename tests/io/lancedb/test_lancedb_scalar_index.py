@@ -725,6 +725,44 @@ class TestSegmentedBTreeIndex:
             }
         ]
 
+    def test_segmented_zonemap_handler_uses_uncommitted_index_api(self):
+        """Test that ZONEMAP segment creation uses the uncommitted index API."""
+
+        class FakeLanceDataset:
+            def __init__(self):
+                self.calls = []
+
+            @property
+            def _ds(self):
+                raise AssertionError("public ZONEMAP segment creation should not use fallback")
+
+            def create_index_uncommitted(self, **kwargs):
+                self.calls.append(kwargs)
+                return {"segment": "zonemap-metadata"}
+
+        fake_ds = FakeLanceDataset()
+        handler = SegmentedFragmentIndexHandler(
+            lance_ds=fake_ds,
+            column="price",
+            index_type="ZONEMAP",
+            name="price_zm_idx",
+            replace=True,
+        )
+
+        raw_segment = handler([1, 2])
+
+        assert pickle.loads(raw_segment) == {"segment": "zonemap-metadata"}
+        assert fake_ds.calls == [
+            {
+                "column": "price",
+                "index_type": "ZONEMAP",
+                "name": "price_zm_idx",
+                "replace": True,
+                "train": True,
+                "fragment_ids": [1, 2],
+            }
+        ]
+
     def test_segmented_inverted_segments_are_merged_before_commit(self):
         """Test that INVERTED segments are merged into one physical segment before commit."""
 
