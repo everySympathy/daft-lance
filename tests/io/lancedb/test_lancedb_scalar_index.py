@@ -686,6 +686,45 @@ class TestSegmentedBTreeIndex:
             )
         ]
 
+    def test_segmented_bitmap_handler_forwards_shard_id(self):
+        """Test that BITMAP segment creation forwards the required shard id."""
+
+        class FakeLanceDataset:
+            def __init__(self):
+                self.calls = []
+
+            @property
+            def _ds(self):
+                raise AssertionError("public BITMAP segment creation should not use fallback")
+
+            def create_index_uncommitted(self, **kwargs):
+                self.calls.append(kwargs)
+                return {"segment": "bitmap-metadata"}
+
+        fake_ds = FakeLanceDataset()
+        handler = SegmentedFragmentIndexHandler(
+            lance_ds=fake_ds,
+            column="flag",
+            index_type="BITMAP",
+            name="flag_idx",
+            replace=True,
+        )
+
+        raw_segment = handler([1, 2], shard_id=7)
+
+        assert pickle.loads(raw_segment) == {"segment": "bitmap-metadata"}
+        assert fake_ds.calls == [
+            {
+                "column": "flag",
+                "index_type": "BITMAP",
+                "name": "flag_idx",
+                "replace": True,
+                "train": True,
+                "fragment_ids": [1, 2],
+                "shard_id": 7,
+            }
+        ]
+
     def test_segmented_btree_basic(self, temp_dir):
         """Test basic segmented BTree index creation and query."""
         data = {
