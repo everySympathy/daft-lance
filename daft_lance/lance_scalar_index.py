@@ -19,7 +19,7 @@ from daft_lance.utils import distribute_fragments_balanced
 logger = logging.getLogger(__name__)
 
 LEGACY_PARTITIONED_INDEX_TYPES = {"BTREE", "INVERTED"}
-SEGMENTED_INDEX_TYPES = {"BITMAP", "BTREE", "INVERTED"}
+SEGMENTED_INDEX_TYPES = {"BITMAP", "BTREE", "INVERTED", "ZONEMAP"}
 MERGED_SEGMENTED_INDEX_TYPES = {"INVERTED"}
 
 
@@ -228,6 +228,8 @@ def create_scalar_index_internal(
             ):
                 raise TypeError(f"Column {column} must be numeric or string type for BTREE index, got {value_type}")
         case "BITMAP":
+            pass
+        case "ZONEMAP":
             pass
         case _:
             logger.warning(
