@@ -72,14 +72,23 @@ index type — mismatches are rejected by Lance's build/commit APIs. Backfill ap
 that leaves the dataset version unchanged (rebuild with `replace=True` and
 no `fragment_ids` instead).
 
+
+> **Breaking change (from 0.5.0):** the `segmented` parameter was removed —
+> the distributed segment-index workflow is now the only code path, and
+> the single-node fallbacks are gone. `replace` now defaults to `True` (matching
+> pylance). Indexes created by older versions of
+> `create_scalar_index` on `INVERTED` columns may carry empty index metadata
+> (see #69); rebuilding them with `replace=True` records full metadata.
+
 #### Index Maintenance
 
 Appended data is not indexed automatically — queries stay correct (uncovered
 fragments fall back to scans) but slow down as the unindexed share grows.
-`optimize_indices` restores index health in one Lance transaction: it indexes
-newly appended fragments, merges small segments, and heals stale coverage
-left by deletes. It is a no-op that commits no new version when there is
-nothing to do.
+`optimize_indices` restores index health on the dataset's latest version:
+it indexes newly appended fragments, merges small segments, and heals stale
+fragment IDs left inside mixed segments by deletes as part of a commit that
+indexes or merges new data. It commits no new version when there is no new
+data to index and no segments to merge.
 
 ```python
 from daft_lance import optimize_indices
@@ -91,17 +100,11 @@ stats = optimize_indices("s3://bucket/my_dataset", indices=["name_idx"], num_ind
 Like lance-ray, `optimize_indices` delegates to pylance's
 `DatasetOptimizer.optimize_indices` and runs in the coordinator process; for
 a distributed rebuild use `create_scalar_index(..., replace=True)`. It
-returns `OptimizeIndicesStats` with the versions before and after, the
-duration, and per-index segment/coverage counts; unknown or empty `indices`
-raise `ValueError`.
+returns `OptimizeIndicesStats` with the dataset versions immediately before
+and after the call, the duration, and per-index segment/coverage counts
+(coverage counts only fragments still live in the manifest); unknown or
+empty `indices` raise `ValueError`, and duplicates are ignored.
 
-
-> **Breaking change (from 0.5.0):** the `segmented` parameter was removed —
-> the distributed segment-index workflow is now the only code path, and the
-> single-node fallbacks are gone. `replace` now defaults to `True` (matching
-> pylance). Indexes created by older versions of
-> `create_scalar_index` on `INVERTED` columns may carry empty index metadata
-> (see #69); rebuilding them with `replace=True` records full metadata.
 
 ### Column Merging
 

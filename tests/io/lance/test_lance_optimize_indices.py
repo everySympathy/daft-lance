@@ -118,7 +118,10 @@ def test_optimize_heals_stale_fragment_ids_after_delete(tmp_path: Path) -> None:
     """A fully deleted fragment inside a mixed segment is dropped from coverage.
 
     Deletes retire fully-dead segments but cannot remove one dead fragment
-    from a segment that also covers live ones; the optimizer heals it.
+    from a segment that also covers live ones; the optimizer heals it — but
+    only as part of a commit that indexes or merges new data, so this test
+    appends first (test_stale_coverage_without_new_data_is_not_healed pins
+    the other side).
     """
     uri = str(tmp_path / "heal.lance")
     lance.write_dataset(
@@ -231,3 +234,88 @@ def test_stats_report_versions_duration_and_per_index_counts(tmp_path: Path) -> 
     for i in stats.indices:
         assert i.fragments_covered_before < len(all_fragments)
         assert i.fragments_covered_after == len(all_fragments)
+
+
+def test_stale_coverage_without_new_data_is_not_healed(tmp_path: Path) -> None:
+    """Healing rides along with commits that index or merge new data.
+
+    With nothing new to index, optimize commits nothing and leaves the
+    stale-only coverage as-is (documented behavior: use a replace=True
+    rebuild to clean it up deterministically).
+    """
+    uri = str(tmp_path / "stale.lance")
+    lance.write_dataset(
+        pa.table({"id": list(range(40)), "name": [f"row {i}" for i in range(40)]}),
+        uri,
+        mode="create",
+        max_rows_per_file=10,
+    )
+    create_scalar_index(uri, column="name", index_type="INVERTED", name="s_idx", fragment_group_size=4)
+    rows_of_fragment_0 = [f"row {i}" for i in range(10)]
+    in_list = ", ".join(f"'{r}'" for r in rows_of_fragment_0)
+    lance.dataset(uri).delete(f"name in ({in_list})")
+    version_before = lance.dataset(uri).version
+    assert 0 in _covered_fragments(uri, "s_idx")
+
+    stats = optimize_indices(uri)
+
+    assert not stats.changed
+    assert lance.dataset(uri).version == version_before
+    assert 0 in _covered_fragments(uri, "s_idx")
+
+
+def test_optimize_after_delete_all_is_noop_with_live_only_coverage(tmp_path: Path) -> None:
+    """After deleting every row the index and its stale ids stay as-is.
+
+    Coverage stats count only live fragments, so a fully-dead dataset
+    reports zero coverage instead of the stale IDs.
+    """
+    uri = str(tmp_path / "gone.lance")
+    lance.write_dataset(pa.table({"name": [f"row {i}" for i in range(20)]}), uri, mode="create", max_rows_per_file=10)
+    create_scalar_index(uri, column="name", index_type="INVERTED", name="s_idx")
+    lance.dataset(uri).delete("name != ''")
+    assert lance.dataset(uri).count_rows() == 0
+    version_before = lance.dataset(uri).version
+
+    stats = optimize_indices(uri)
+
+    assert not stats.changed
+    assert lance.dataset(uri).version == version_before
+    idx = stats.indices[0]
+    assert idx.fragments_covered_before == 0
+    assert idx.fragments_covered_after == 0
+    assert idx.segments_before == idx.segments_after  # index not retired
+
+
+def test_duplicate_indices_are_deduplicated(tmp_path: Path) -> None:
+    """Duplicate names optimize and report each index exactly once."""
+    uri = _make_dataset(tmp_path / "dupes.lance")
+    create_scalar_index(uri, column="name", index_type="INVERTED")
+    extra = pa.table({"id": list(range(100, 120)), "name": [f"name-{100 + i}" for i in range(20)]})
+    lance.write_dataset(extra, uri, mode="append", max_rows_per_file=20)
+
+    stats = optimize_indices(uri, indices=["name_idx", "name_idx"])
+
+    assert [i.name for i in stats.indices] == ["name_idx"]
+    assert _covered_fragments(uri, "name_idx") == set(_fragment_ids(uri))
+
+
+def test_index_snapshot_falls_back_to_list_indices() -> None:
+    """Legacy manifests that describe_indices cannot parse still report names.
+
+    Same degradation create_scalar_index uses (_existing_index_names);
+    counts are unknown in that case.
+    """
+    from daft_lance.lance_scalar_index import _index_snapshot
+
+    class FakeLanceDataset:
+        def describe_indices(self):
+            raise RuntimeError("missing index_details")
+
+        def list_indices(self):
+            return [{"name": "legacy_idx"}]
+
+        def get_fragments(self):
+            return []
+
+    assert _index_snapshot(FakeLanceDataset()) == {"legacy_idx": (0, 0)}

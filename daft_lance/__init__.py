@@ -13,11 +13,10 @@ from ._lance import (
     read_lance,
     write_lance,
 )
-from .lance_scalar_index import OptimizedIndexStats, OptimizeIndicesStats
+from .lance_scalar_index import OptimizeIndicesStats
 
 __all__ = [
     "OptimizeIndicesStats",
-    "OptimizedIndexStats",
     "compact_files",
     "create_scalar_index",
     "merge_columns",

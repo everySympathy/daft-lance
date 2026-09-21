@@ -561,8 +561,6 @@ def optimize_indices(
     indices: list[str] | None = None,
     num_indices_to_merge: int | None = None,
     storage_options: dict[str, Any] | None = None,
-    version: int | str | None = None,
-    asof: str | None = None,
     block_size: int | None = None,
     commit_lock: Any | None = None,
     index_cache_size: int | None = None,
@@ -574,10 +572,11 @@ def optimize_indices(
     As data is appended it is not added to existing indexes automatically:
     queries keep working (uncovered fragments fall back to scans) but they
     get slower as the unindexed share grows. This function restores index
-    health in one Lance transaction: newly appended fragments are indexed,
-    small segments are merged, and stale fragment IDs left inside mixed
-    segments by deletes are healed. It is a no-op that commits no new
-    version when every index already covers all fragments.
+    health on the dataset's latest version: newly appended fragments are
+    indexed, small segments are merged, and stale fragment IDs left inside
+    mixed segments by deletes are healed as part of a commit that indexes
+    or merges new data. It commits no new version when there is no new
+    data to index and no segments to merge.
 
     Delegates to pylance's ``DatasetOptimizer.optimize_indices`` — the same
     choice lance-ray makes — so it runs in the coordinator process (Lance
@@ -594,13 +593,11 @@ def optimize_indices(
             {"root": "/data"} for "dir" or {"uri": "http://host:port"} for "rest".
         indices: Names of the indexes to optimize. ``None`` (the default)
             optimizes every index on the dataset. Unknown names and an empty
-            list raise ``ValueError``.
+            list raise ``ValueError``; duplicates are ignored.
         num_indices_to_merge: How many segments to merge when compacting an
             index (passed to pylance). ``0`` indexes the new data into a new
             segment instead of merging; ``None`` uses pylance's default.
         storage_options: Storage options for the dataset.
-        version: Version of the dataset to use as the starting snapshot.
-        asof: Timestamp to use for time travel queries.
         block_size: Block size for the dataset.
         commit_lock: Commit lock for the dataset.
         index_cache_size: Size of the index cache.
@@ -608,9 +605,12 @@ def optimize_indices(
         metadata_cache_size_bytes: Size of the metadata cache in bytes.
 
     Returns:
-        OptimizeIndicesStats: version numbers before and after, wall-clock
-        duration, and per-index segment/coverage counts before and after.
-        ``changed`` is ``True`` only when a new version was committed.
+        OptimizeIndicesStats: versions of the dataset's latest snapshot
+        immediately before and after the call, wall-clock duration, and
+        per-index segment/coverage counts (coverage counts only fragments
+        still live in the manifest). ``changed`` is ``True`` when a new
+        version became visible during the call — with no concurrent
+        writers, exactly when this run committed one.
 
     Raises:
         ValueError: If ``indices`` is empty or names indexes that do not
@@ -618,15 +618,17 @@ def optimize_indices(
 
     Examples:
         >>> import daft_lance
-        >>> stats = daft_lance.optimize_indices("s3://my-bucket/dataset/")
-        >>> stats.changed
+        >>> stats = daft_lance.optimize_indices("s3://my-bucket/dataset/")  # doctest: +SKIP
+        >>> stats.changed  # doctest: +SKIP
         True
-        >>> [i.name for i in stats.indices]
+        >>> [i.name for i in stats.indices]  # doctest: +SKIP
         ['name_idx']
 
         Optimize one index and merge its small segments:
 
-        >>> daft_lance.optimize_indices("s3://my-bucket/dataset/", indices=["name_idx"], num_indices_to_merge=4)
+        >>> daft_lance.optimize_indices(  # doctest: +SKIP
+        ...     "s3://my-bucket/dataset/", indices=["name_idx"], num_indices_to_merge=4
+        ... )
     """
     io_config = context.get_context().daft_planning_config.default_io_config if io_config is None else io_config
 
@@ -637,8 +639,6 @@ def optimize_indices(
         namespace_impl=namespace_impl,
         namespace_properties=namespace_properties,
         table_id=table_id,
-        version=version,
-        asof=asof,
         block_size=block_size,
         commit_lock=commit_lock,
         index_cache_size=index_cache_size,
