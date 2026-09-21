@@ -553,7 +553,7 @@ def optimize_indices_internal(
     )
     version_before = lance_ds.version
     start = time.monotonic()
-    lance_ds.optimize.optimize_indices(**call_kwargs)
+    lance_ds.optimize.optimize_indices(**call_kwargs)  # type: ignore[no-untyped-call]
     duration = time.monotonic() - start
 
     latest = open_context.open_latest()
