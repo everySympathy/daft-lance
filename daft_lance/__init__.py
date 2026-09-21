@@ -9,15 +9,20 @@ from ._lance import (
     create_scalar_index,
     merge_columns,
     merge_columns_df,
+    optimize_indices,
     read_lance,
     write_lance,
 )
+from .lance_scalar_index import OptimizedIndexStats, OptimizeIndicesStats
 
 __all__ = [
+    "OptimizeIndicesStats",
+    "OptimizedIndexStats",
     "compact_files",
     "create_scalar_index",
     "merge_columns",
     "merge_columns_df",
+    "optimize_indices",
     "read_lance",
     "take_blobs",
     "write_lance",

@@ -72,6 +72,29 @@ index type — mismatches are rejected by Lance's build/commit APIs. Backfill ap
 that leaves the dataset version unchanged (rebuild with `replace=True` and
 no `fragment_ids` instead).
 
+#### Index Maintenance
+
+Appended data is not indexed automatically — queries stay correct (uncovered
+fragments fall back to scans) but slow down as the unindexed share grows.
+`optimize_indices` restores index health in one Lance transaction: it indexes
+newly appended fragments, merges small segments, and heals stale coverage
+left by deletes. It is a no-op that commits no new version when there is
+nothing to do.
+
+```python
+from daft_lance import optimize_indices
+
+stats = optimize_indices("s3://bucket/my_dataset")
+stats = optimize_indices("s3://bucket/my_dataset", indices=["name_idx"], num_indices_to_merge=4)
+```
+
+Like lance-ray, `optimize_indices` delegates to pylance's
+`DatasetOptimizer.optimize_indices` and runs in the coordinator process; for
+a distributed rebuild use `create_scalar_index(..., replace=True)`. It
+returns `OptimizeIndicesStats` with the versions before and after, the
+duration, and per-index segment/coverage counts; unknown or empty `indices`
+raise `ValueError`.
+
 
 > **Breaking change (from 0.5.0):** the `segmented` parameter was removed —
 > the distributed segment-index workflow is now the only code path, and the

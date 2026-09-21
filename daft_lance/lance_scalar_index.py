@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import dataclasses
 import logging
 import pickle
+import time
 from typing import TYPE_CHECKING, Any, cast
 
 import daft
@@ -464,3 +466,121 @@ def _validate_segments_against_manifest(
                 "not covered by any built segment (a worker result was likely lost). Re-run the "
                 "index build."
             )
+
+
+@dataclasses.dataclass(frozen=True)
+class OptimizedIndexStats:
+    """Per-index outcome of an ``optimize_indices`` run.
+
+    An index that the optimizer retires entirely (all of its fragments were
+    deleted) reports zeros for the ``*_after`` fields.
+    """
+
+    name: str
+    segments_before: int
+    segments_after: int
+    fragments_covered_before: int
+    fragments_covered_after: int
+
+
+@dataclasses.dataclass(frozen=True)
+class OptimizeIndicesStats:
+    """Outcome of an ``optimize_indices`` run over one dataset."""
+
+    version_before: int
+    version_after: int
+    duration_seconds: float
+    indices: list[OptimizedIndexStats]
+
+    @property
+    def changed(self) -> bool:
+        """Whether the run committed a new dataset version."""
+        return self.version_after != self.version_before
+
+
+def _index_snapshot(lance_ds: lance.LanceDataset) -> dict[str, tuple[int, int]]:
+    """Map index name to ``(segment count, covered-fragment count)``."""
+    snapshot: dict[str, tuple[int, int]] = {}
+    for desc in lance_ds.describe_indices():
+        segments = desc.segments or []
+        covered = {fid for segment in segments for fid in (segment.fragment_ids or ())}
+        snapshot[desc.name] = (len(segments), len(covered))
+    return snapshot
+
+
+def optimize_indices_internal(
+    lance_ds: lance.LanceDataset,
+    open_context: DatasetOpenContext,
+    *,
+    indices: list[str] | None = None,
+    num_indices_to_merge: int | None = None,
+) -> OptimizeIndicesStats:
+    """Incrementally maintain existing indexes.
+
+    Delegates to pylance's ``DatasetOptimizer.optimize_indices`` — the same
+    choice lance-ray makes — because Lance core owns the delta-index
+    semantics: it extends coverage over newly appended fragments, merges
+    small segments (``num_indices_to_merge``), and heals stale fragment IDs
+    left inside mixed segments by deletes. It commits at most one new
+    version and is a no-op (no new version) when every index already covers
+    all fragments. Heavier changes are a distributed rebuild:
+    ``create_scalar_index(..., replace=True)``.
+
+    ``indices`` is our parameter and gets deterministic semantics here
+    because pylance silently ignores unknown names: an empty list raises,
+    and unknown names raise listing the available indexes. Merge-count
+    validation and everything about index internals belong to Lance.
+    """
+    before = _index_snapshot(lance_ds)
+    if indices is not None:
+        if len(indices) == 0:
+            raise ValueError("indices must be a non-empty list of index names; pass None to optimize all indexes.")
+        unknown = sorted(set(indices) - before.keys())
+        if unknown:
+            raise ValueError(f"indices {unknown} do not exist on the dataset. Available index names: {sorted(before)}")
+
+    call_kwargs: dict[str, Any] = {}
+    if indices is not None:
+        call_kwargs["index_names"] = list(indices)
+    if num_indices_to_merge is not None:
+        call_kwargs["num_indices_to_merge"] = num_indices_to_merge
+
+    logger.info(
+        "Optimizing indices: uri=%s, indices=%s, num_indices_to_merge=%s",
+        open_context.uri,
+        indices if indices is not None else "(all)",
+        num_indices_to_merge,
+    )
+    version_before = lance_ds.version
+    start = time.monotonic()
+    lance_ds.optimize.optimize_indices(**call_kwargs)
+    duration = time.monotonic() - start
+
+    latest = open_context.open_latest()
+    after = _index_snapshot(latest)
+
+    selected = indices if indices is not None else sorted(before)
+    per_index = [
+        OptimizedIndexStats(
+            name=name,
+            segments_before=before.get(name, (0, 0))[0],
+            segments_after=after.get(name, (0, 0))[0],
+            fragments_covered_before=before.get(name, (0, 0))[1],
+            fragments_covered_after=after.get(name, (0, 0))[1],
+        )
+        for name in selected
+    ]
+
+    logger.info(
+        "Optimized %d indices in %.2fs: version %d -> %d",
+        len(per_index),
+        duration,
+        version_before,
+        latest.version,
+    )
+    return OptimizeIndicesStats(
+        version_before=version_before,
+        version_after=latest.version,
+        duration_seconds=duration,
+        indices=per_index,
+    )
